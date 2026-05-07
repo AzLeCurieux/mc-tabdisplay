@@ -1,0 +1,41 @@
+plugins {
+    id 'java'
+    id 'net.neoforged.gradle.userdev' version '7.0.145'
+}
+
+version = project.mod_version
+group   = 'com.azlecurieux'
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(21) }
+}
+
+dependencies {
+    implementation "net.neoforged:neoforge:${project.neoforge_version}"
+}
+
+tasks.withType(ProcessResources).configureEach {
+    def props = [
+        mod_version      : project.mod_version,
+        neoforge_version : project.neoforge_version,
+        minecraft_version: project.minecraft_version
+    ]
+    inputs.properties props
+    filesMatching('META-INF/neoforge.mods.toml') { expand props }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    archiveBaseName = 'tabdisplay'
+    manifest {
+        attributes([
+            'Specification-Title'   : 'tabdisplay',
+            'Specification-Version' : '1',
+            'Implementation-Title'  : project.name,
+            'Implementation-Version': project.version
+        ])
+    }
+}

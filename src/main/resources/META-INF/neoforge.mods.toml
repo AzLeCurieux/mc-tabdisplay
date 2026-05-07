@@ -1,0 +1,24 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+    modId="tabdisplay"
+    version="${mod_version}"
+    displayName="Tab Display"
+    displayTest="IGNORE_SERVER_VERSION"
+    description="Tab list: France/Canada clock (header) + top-5 playtime leaderboard (footer). Server-side only."
+
+[[dependencies.tabdisplay]]
+    modId="neoforge"
+    type="required"
+    versionRange="[${neoforge_version},)"
+    ordering="NONE"
+    side="SERVER"
+
+[[dependencies.tabdisplay]]
+    modId="minecraft"
+    type="required"
+    versionRange="[${minecraft_version},)"
+    ordering="NONE"
+    side="SERVER"
