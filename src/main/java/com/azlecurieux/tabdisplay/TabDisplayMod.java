@@ -44,18 +44,23 @@ public class TabDisplayMod {
 
     /** Accumulate in-session time every minute (20 ticks/s × 60 s). */
     private static final int ACCUM_TICKS   = 1200;
-    /** Full rebuild + send every 5 minutes. */
+    /** Full rebuild + save every 5 minutes. */
     private static final int DISPLAY_TICKS = 6000;
+    /** Resend cached packet every 30 seconds — prevents other mods from clearing the tab. */
+    private static final int RESEND_TICKS  = 600;
 
     // ── Runtime state ─────────────────────────────────────────────────────────
     private final Map<String, PlayerRecord> allTime      = new LinkedHashMap<>();
     private final Map<String, Long>         sessionStart = new HashMap<>();
 
-    private Path    dataFile;
-    private int     accumTick    = 0;
-    private int     displayTick  = 0;
+    private Path                     dataFile;
+    private int                      accumTick    = 0;
+    private int                      displayTick  = 0;
+    private int                      resendTick   = 0;
     /** True when an update was due but the server was empty; cleared on next join. */
-    private boolean pendingUpdate = false;
+    private boolean                  pendingUpdate = false;
+    /** Cached packet — rebuilt every 5 min, resent every 30 sec. */
+    private ClientboundTabListPacket cachedPacket  = null;
 
     // ── Data model ────────────────────────────────────────────────────────────
     static class PlayerRecord {
@@ -108,7 +113,7 @@ public class TabDisplayMod {
 
         // Rebuild and push to all players — online indicator changed
         List<ServerPlayer> all = List.copyOf(server.getPlayerList().getPlayers());
-        sendTabToAll(all);
+        rebuildAndSendAll(all);
     }
 
     // ── Player leaves ─────────────────────────────────────────────────────────
@@ -132,7 +137,7 @@ public class TabDisplayMod {
                 .filter(p -> !p.getUUID().toString().equals(uuid))
                 .collect(Collectors.toList());
 
-        if (!remaining.isEmpty()) sendTabToAll(remaining);
+        if (!remaining.isEmpty()) rebuildAndSendAll(remaining);
     }
 
     // ── Tick handler ──────────────────────────────────────────────────────────
@@ -153,6 +158,13 @@ public class TabDisplayMod {
             }
         }
 
+        // Resend cached packet every 30 sec — overrides any mod that cleared the tab
+        if (++resendTick >= RESEND_TICKS) {
+            resendTick = 0;
+            List<ServerPlayer> current = List.copyOf(server.getPlayerList().getPlayers());
+            if (!current.isEmpty() && cachedPacket != null) sendCached(current);
+        }
+
         // Full rebuild every 5 minutes
         if (++displayTick < DISPLAY_TICKS) return;
         displayTick = 0;
@@ -165,23 +177,26 @@ public class TabDisplayMod {
 
         pendingUpdate = false;
         saveData();
-        sendTabToAll(players);
+        rebuildAndSendAll(players);
     }
 
-    // ── Build and push header+footer to a list of players ────────────────────
-    private void sendTabToAll(List<ServerPlayer> players) {
+    // ── Rebuild cache + push to all players ──────────────────────────────────
+    private void rebuildAndSendAll(List<ServerPlayer> players) {
         if (players.isEmpty()) return;
 
         Set<String> online = new HashSet<>();
         for (ServerPlayer p : players) online.add(p.getUUID().toString());
 
         List<Map.Entry<String, PlayerRecord>> top5 = buildTop5();
+        cachedPacket = new ClientboundTabListPacket(buildHeader(), buildFooter(top5, online));
+        sendCached(players);
+    }
 
-        ClientboundTabListPacket pkt = new ClientboundTabListPacket(
-                buildHeader(), buildFooter(top5, online));
-
+    /** Send the already-built cached packet without rebuilding anything. */
+    private void sendCached(List<ServerPlayer> players) {
+        if (cachedPacket == null || players.isEmpty()) return;
         for (ServerPlayer p : players) {
-            if (p.connection != null) p.connection.send(pkt);
+            if (p.connection != null) p.connection.send(cachedPacket);
         }
     }
 
