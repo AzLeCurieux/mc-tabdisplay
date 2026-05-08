@@ -2,15 +2,10 @@ package com.azlecurieux.tabdisplay;
 
 import com.google.gson.*;
 import com.google.gson.reflect.TypeToken;
-import com.mojang.authlib.GameProfile;
-import com.mojang.authlib.properties.Property;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
-import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundTabListPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -44,19 +39,9 @@ public class TabDisplayMod {
     private static final Type   DATA_TYPE = new TypeToken<Map<String, PlayerRecord>>() {}.getType();
     private static final String DATA_FILE = "tabdisplay-stats.json";
 
-    // ── Fake tab-list slot UUIDs (deterministic, never collide with real players) ──
-    private static final List<UUID> SLOT_UUIDS = List.of(
-            UUID.fromString("0000cafe-0000-0000-0000-000000000001"),
-            UUID.fromString("0000cafe-0000-0000-0000-000000000002"),
-            UUID.fromString("0000cafe-0000-0000-0000-000000000003"),
-            UUID.fromString("0000cafe-0000-0000-0000-000000000004"),
-            UUID.fromString("0000cafe-0000-0000-0000-000000000005")
-    );
-
     private static final String[] RANK_STYLE = {"§6§l", "§7§l", "§e§l", "§7", "§7"};
     private static final String[] RANK_LABEL = {"#1", "#2", "#3", "#4", "#5"};
 
-    // ── Tick intervals ────────────────────────────────────────────────────────
     /** Accumulate in-session time every minute (20 ticks/s × 60 s). */
     private static final int ACCUM_TICKS   = 1200;
     /** Full rebuild + send every 5 minutes. */
@@ -69,15 +54,13 @@ public class TabDisplayMod {
     private Path    dataFile;
     private int     accumTick    = 0;
     private int     displayTick  = 0;
-    /** Becomes true when an update was due but the server was empty; cleared on next join. */
+    /** True when an update was due but the server was empty; cleared on next join. */
     private boolean pendingUpdate = false;
 
     // ── Data model ────────────────────────────────────────────────────────────
     static class PlayerRecord {
         String name;
         long   seconds;
-        String skinValue;      // base64 texture blob  (nullable → default skin)
-        String skinSignature;  // Mojang signature     (nullable)
 
         PlayerRecord(String name, long seconds) {
             this.name    = name;
@@ -90,7 +73,7 @@ public class TabDisplayMod {
         NeoForge.EVENT_BUS.register(this);
     }
 
-    // ── Server ready: load our data then merge vanilla play_time stats ─────────
+    // ── Server ready: load our data, then merge vanilla play_time stats ────────
     @SubscribeEvent
     public void onServerStarted(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
@@ -113,27 +96,19 @@ public class TabDisplayMod {
             ex.name = name;
             return ex;
         });
-        cacheSkin(uuid, player);
 
         MinecraftServer server = player.getServer();
         if (server == null) return;
 
-        // If an update was pending (server was empty), do it now
+        // If an update was pending (server was empty), flush it now
         if (pendingUpdate) {
             saveData();
             pendingUpdate = false;
         }
 
-        // Full player list at this moment (joining player is already included)
-        List<ServerPlayer> all    = List.copyOf(server.getPlayerList().getPlayers());
-        Set<String>        online = toUuidSet(all);
-        List<Map.Entry<String, PlayerRecord>> top5 = buildTop5();
-
-        // Send fake leaderboard entries to the joining player only
-        sendFakeEntries(player, top5, online, false);
-
-        // Rebuild and push header+footer to everyone (online indicator changed)
-        sendTabToAll(all, top5, online);
+        // Rebuild and push to all players — online indicator changed
+        List<ServerPlayer> all = List.copyOf(server.getPlayerList().getPlayers());
+        sendTabToAll(all);
     }
 
     // ── Player leaves ─────────────────────────────────────────────────────────
@@ -151,20 +126,13 @@ public class TabDisplayMod {
         MinecraftServer server = player.getServer();
         if (server == null) return;
 
-        // Build the list of remaining players (exclude the one leaving)
+        // Rebuild for remaining players — online indicator changed
         List<ServerPlayer> remaining = List.copyOf(server.getPlayerList().getPlayers())
                 .stream()
                 .filter(p -> !p.getUUID().toString().equals(uuid))
                 .collect(Collectors.toList());
 
-        if (remaining.isEmpty()) return;
-
-        List<Map.Entry<String, PlayerRecord>> top5   = buildTop5();
-        Set<String>                            online = toUuidSet(remaining);
-
-        // Update fake entries for remaining players (online indicator changed)
-        for (ServerPlayer p : remaining) sendFakeEntries(p, top5, online, true);
-        sendTabToAll(remaining, top5, online);
+        if (!remaining.isEmpty()) sendTabToAll(remaining);
     }
 
     // ── Tick handler ──────────────────────────────────────────────────────────
@@ -197,12 +165,24 @@ public class TabDisplayMod {
 
         pendingUpdate = false;
         saveData();
+        sendTabToAll(players);
+    }
 
-        List<Map.Entry<String, PlayerRecord>> top5   = buildTop5();
-        Set<String>                            online = toUuidSet(players);
+    // ── Build and push header+footer to a list of players ────────────────────
+    private void sendTabToAll(List<ServerPlayer> players) {
+        if (players.isEmpty()) return;
 
-        for (ServerPlayer p : players) sendFakeEntries(p, top5, online, true);
-        sendTabToAll(players, top5, online);
+        Set<String> online = new HashSet<>();
+        for (ServerPlayer p : players) online.add(p.getUUID().toString());
+
+        List<Map.Entry<String, PlayerRecord>> top5 = buildTop5();
+
+        ClientboundTabListPacket pkt = new ClientboundTabListPacket(
+                buildHeader(), buildFooter(top5, online));
+
+        for (ServerPlayer p : players) {
+            if (p.connection != null) p.connection.send(pkt);
+        }
     }
 
     // ── Build sorted top-5 list ───────────────────────────────────────────────
@@ -212,79 +192,6 @@ public class TabDisplayMod {
                 .sorted((a, b) -> Long.compare(b.getValue().seconds, a.getValue().seconds))
                 .limit(5)
                 .collect(Collectors.toList());
-    }
-
-    // ── Send fake player entries (with skins) to one player ───────────────────
-    private void sendFakeEntries(
-            ServerPlayer target,
-            List<Map.Entry<String, PlayerRecord>> top5,
-            Set<String> online,
-            boolean removeFirst) {
-
-        if (target.connection == null) return;
-
-        if (removeFirst) {
-            target.connection.send(new ClientboundPlayerInfoRemovePacket(SLOT_UUIDS));
-        }
-        if (top5.isEmpty()) return;
-
-        List<ClientboundPlayerInfoUpdatePacket.Entry> entries = new ArrayList<>();
-
-        for (int i = 0; i < top5.size(); i++) {
-            Map.Entry<String, PlayerRecord> e   = top5.get(i);
-            PlayerRecord                    rec = e.getValue();
-            UUID                            sid = SLOT_UUIDS.get(i);
-
-            // GameProfile with cached skin — gives the client the head to render
-            GameProfile profile = new GameProfile(sid, "");
-            if (rec.skinValue != null) {
-                profile.getProperties().put("textures",
-                        new Property("textures", rec.skinValue, rec.skinSignature));
-            }
-
-            long h = rec.seconds / 3600;
-            long m = (rec.seconds % 3600) / 60;
-            String presence = online.contains(e.getKey()) ? "§a●" : "§8○";
-            String label    = " " + RANK_STYLE[i] + RANK_LABEL[i]
-                            + " " + presence
-                            + " §f" + rec.name
-                            + "  §8" + h + "h " + String.format("%02d", m) + "m";
-
-            entries.add(new ClientboundPlayerInfoUpdatePacket.Entry(
-                    sid,
-                    profile,
-                    true,            // listed → visible in tab
-                    0,               // latency
-                    GameType.SURVIVAL,
-                    Component.literal(label),
-                    null             // no chat session
-            ));
-        }
-
-        target.connection.send(new ClientboundPlayerInfoUpdatePacket(
-                EnumSet.of(
-                        ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
-                        ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED,
-                        ClientboundPlayerInfoUpdatePacket.Action.UPDATE_DISPLAY_NAME,
-                        ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY,
-                        ClientboundPlayerInfoUpdatePacket.Action.UPDATE_GAME_MODE
-                ),
-                entries
-        ));
-    }
-
-    // ── Build and push header+footer to a list of players ────────────────────
-    private void sendTabToAll(
-            List<ServerPlayer> players,
-            List<Map.Entry<String, PlayerRecord>> top5,
-            Set<String> online) {
-
-        if (players.isEmpty()) return;
-        ClientboundTabListPacket pkt = new ClientboundTabListPacket(
-                buildHeader(), buildFooter(top5.isEmpty()));
-        for (ServerPlayer p : players) {
-            if (p.connection != null) p.connection.send(pkt);
-        }
     }
 
     // ── Header: server name + France/Canada time ──────────────────────────────
@@ -303,28 +210,38 @@ public class TabDisplayMod {
         );
     }
 
-    // ── Footer: leaderboard title + legend ────────────────────────────────────
-    private Component buildFooter(boolean empty) {
-        if (empty) return Component.empty();
-        return Component.literal(
-                "\n"
-                + "§8§m                                          §r\n"
-                + "§6§l           Meilleurs joueurs              \n"
-                + "§8§m                                          §r\n"
-                + "\n"
-                + "§7§o§a●§7§o = connecté   §8○§7§o = hors ligne"
-        );
-    }
+    // ── Footer: top-5 leaderboard ─────────────────────────────────────────────
+    private Component buildFooter(List<Map.Entry<String, PlayerRecord>> top5, Set<String> online) {
+        if (top5.isEmpty()) return Component.empty();
 
-    // ── Cache a player's skin texture for offline rendering ───────────────────
-    private void cacheSkin(String uuid, ServerPlayer player) {
-        Collection<Property> props = player.getGameProfile().getProperties().get("textures");
-        if (props == null || props.isEmpty()) return;
-        Property tex = props.iterator().next();
-        PlayerRecord rec = allTime.get(uuid);
-        if (rec == null) return;
-        rec.skinValue     = tex.value();
-        rec.skinSignature = tex.signature();
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n");
+        sb.append("§8§m                                          §r\n");
+        sb.append("§6§l           Meilleurs joueurs              \n");
+        sb.append("§8§m                                          §r\n");
+        sb.append("\n");
+
+        for (int i = 0; i < top5.size(); i++) {
+            Map.Entry<String, PlayerRecord> entry = top5.get(i);
+            PlayerRecord rec      = entry.getValue();
+            boolean      isOnline = online.contains(entry.getKey());
+
+            long h = rec.seconds / 3600;
+            long m = (rec.seconds % 3600) / 60;
+
+            sb.append("  ")
+              .append(RANK_STYLE[i]).append(RANK_LABEL[i])
+              .append("  ")
+              .append(isOnline ? "§a● " : "§8○ ")
+              .append("§f").append(rec.name)
+              .append("  §8").append(h).append("h ").append(String.format("%02d", m)).append("m")
+              .append("\n");
+        }
+
+        sb.append("\n");
+        sb.append("§7§o§a●§7§o = connecté   §8○§7§o = hors ligne");
+
+        return Component.literal(sb.toString());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -338,12 +255,6 @@ public class TabDisplayMod {
 
     private static long elapsedSeconds(long startMillis) {
         return Math.max(0L, (System.currentTimeMillis() - startMillis) / 1000L);
-    }
-
-    private static Set<String> toUuidSet(List<ServerPlayer> players) {
-        Set<String> s = new HashSet<>();
-        for (ServerPlayer p : players) s.add(p.getUUID().toString());
-        return s;
     }
 
     // ── JSON persistence ──────────────────────────────────────────────────────
@@ -376,8 +287,8 @@ public class TabDisplayMod {
                       String uuid  = fname.substring(0, fname.length() - 5);
 
                       try (Reader r = Files.newBufferedReader(statFile)) {
-                          JsonObject root = JsonParser.parseReader(r).getAsJsonObject();
-                          JsonObject stats = root.getAsJsonObject("stats");
+                          JsonObject root   = JsonParser.parseReader(r).getAsJsonObject();
+                          JsonObject stats  = root.getAsJsonObject("stats");
                           if (stats == null) return;
                           JsonObject custom = stats.getAsJsonObject("minecraft:custom");
                           if (custom == null || !custom.has("minecraft:play_time")) return;
@@ -388,7 +299,7 @@ public class TabDisplayMod {
                           String name = nameCache.getOrDefault(uuid,
                                   uuid.length() >= 8 ? uuid.substring(0, 8) + "…" : uuid);
 
-                          // Keep whichever source has more time
+                          // Keep whichever source shows more time
                           allTime.merge(uuid, new PlayerRecord(name, vanillaSec), (ex, v) -> {
                               if (v.seconds > ex.seconds) ex.seconds = v.seconds;
                               ex.name = nameCache.getOrDefault(uuid, ex.name);
@@ -399,7 +310,7 @@ public class TabDisplayMod {
         } catch (IOException ignored) {}
     }
 
-    // Parse usercache.json for UUID→name lookup
+    // Parse usercache.json for UUID → name resolution
     private Map<String, String> loadUsercache(MinecraftServer server) {
         Map<String, String> result = new HashMap<>();
         try {
